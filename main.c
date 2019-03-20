@@ -165,6 +165,8 @@ will remove items as they are added, meaning the send task should always find
 the queue empty. */
 #define mainQUEUE_LENGTH					( 1 )
 
+static xSemaphoreHandle xEventSemaphore = NULL;
+
 /*-----------------------------------------------------------*/
 
 /*
@@ -173,23 +175,50 @@ the queue empty. */
  */
 static void prvSetupHardware( void );
 
-struct task_list {
-	TaskHandle_t t_handle;
-	uint_32 deadline;
-	uint_32 task_type;
-	uint_32 creation_time;
-	struct task_list *next_cell;
-	struct task_list *previous_cell;
+typedef enum task_type {
+	PERIODIC = 0,
+	APERIODIC = 1
 };
 
-struct overdue_tasks {
+typedef enum scheduler_function {
+	create = 0,
+	delete = 1,
+	return_overdue_list = 2,
+	return_active_list = 3
+} scheduler_function;
+
+typedef struct task_param {
+	TaskHandle_t t_handle;
+	uint32_t release_time;
+	uint32_t exec_time;
+	uint32_t deadline;
+	int priority;
+	int task_type;
+} task_param;
+
+typedef struct dd_message {
+	scheduler_function function_to_call;
+	task_param task;
+} dd_message;
+
+
+typedef struct task_list {
+	TaskHandle_t t_handle;
+	uint32_t deadline;
+	uint32_t task_type;
+	uint32_t creation_time;
+	struct task_list *next_cell;
+	struct task_list *previous_cell;
+} task_list;
+
+typedef struct overdue_tasks {
 	TaskHandle_t tid;
-	uint_32 deadline;
-	uint_32 task_type;
-	uint_32 creation_time;
+	uint32_t deadline;
+	uint32_t task_type;
+	uint32_t creation_time;
 	struct overdue_tasks *next_cell; struct
 	overdue_tasks *previous_cell;
-};
+} overdue_tasks;
 
 /* Queues */
 xQueueHandle DD_Scheduler_Queue = 0;
@@ -200,87 +229,186 @@ static void Task_Generator();
 static void User_Tasks();
 static void Monitor_Task();
 
-/* DD scheduler interface functions */
-TaskHandle_t dd_tcreate(Task_param);
-uint_32 dd_delete(TaskHandle_t);
-uint_32 dd_return_active_list(**list);
-uint_32 dd_return_overdue_list(**list);
+static void dummy_task(uint32_t wait_time);
 
+
+/* DD scheduler interface functions */
+TaskHandle_t dd_tcreate(task_param task);
+uint32_t dd_delete(TaskHandle_t t_handle);
+uint32_t dd_return_active_list(struct task_list **list);
+uint32_t dd_return_overdue_list(struct overdue_tasks **list);
+
+/* aperiodic and periodic task generator helper functions */
+task_param generate_periodic_task();
+task_param generate_aperiodic_task();
+
+/* linked list helper functions */
+static void add_to_list(task_list *head_of_list, task_param task);
 
 /*-----------------------------------------------------------*/
 
 int main(void)
 {
 	prvSetupHardware();
-	
+
 	DD_Scheduler_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(uint32_t));
 
 	xTaskCreate(DD_Scheduler, "DD_Scheduler", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 	xTaskCreate(Task_Generator, "Task_Generator", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 	xTaskCreate(User_Tasks, "User_Tasks", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 	xTaskCreate(Monitor_Task, "Monitor_Task", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
-	
+
 	/* Start the tasks and timer running. */
 	vTaskStartScheduler();
-
 }
 
 /* DD Scheduler interface functions */
-TaskHandle_t dd_tcreate(Task_param) {
+TaskHandle_t dd_tcreate(task_param task) {
 	xQueueHandle Task_Creator_Queue;
-	Task_Creator_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(uint32_t));
-	
-	
-	
-	
+	Task_Creator_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(dd_message));
+	TaskHandle_t task_handle;
+
+	xTaskCreate(dummy_task, "dummy_task", configMINIMAL_STACK_SIZE, NULL, 1, &task_handle);
+
+	task.t_handle = task_handle;
+
+	dd_message dd_scheduler_message;
+	dd_scheduler_message.function_to_call = create;
+	dd_scheduler_message.task = task;
+
+	xQueueSend(Task_Creator_Queue, &dd_scheduler_message, 1000);
+	xQueueSend(DD_Scheduler_Queue, &Task_Creator_Queue, 1000);
+
+
 }
 
-uint_32 dd_delete(TaskHandle_t) {
-	
+uint32_t dd_delete(TaskHandle_t t_handle) {
+
 }
 
-uint_32 dd_return_active_list(**list) {
-	
+uint32_t dd_return_active_list(struct task_list **list) {
+
 }
 
-uint_32 dd_return_overdue_list(**list) {
-	
+uint32_t dd_return_overdue_list(struct overdue_tasks **list) {
+
+}
+
+
+/* periodic and aperiodic task generators */
+
+task_param generate_periodic_task() {
+	struct task_param periodic_task;
+
+	return periodic_task;
+}
+
+task_param generate_aperiodic_task() {
+	task_param aperiodic_task;
+
+	aperiodic_task.exec_time = 100;
+	aperiodic_task.release_time = 0;
+	aperiodic_task.deadline = 200;
+	aperiodic_task.task_type = APERIODIC;
+
+	return aperiodic_task;
+}
+
+static void add_to_list(task_list *head_of_list, task_param task) {
+	task_list *task_to_add = (task_list*) malloc(sizeof(task_list));
+
+	task_to_add->deadline = task.deadline;
+	task_to_add->task_type = task.task_type;
+	task_to_add->creation_time = task.release_time;
+	task_to_add->next_cell = NULL;
+	task_to_add->t_handle = task.t_handle;
+
+	if (head_of_list == NULL) {
+		head_of_list = task_to_add;
+		head_of_list->previous_cell = NULL;
+	}
+
+	else {
+		head_of_list->previous_cell = task_to_add;
+		task_to_add->next_cell = head_of_list;
+		head_of_list = task_to_add;
+	}
+
+}
+
+static void dummy_task(uint32_t wait_time) {
+	int j = 0;
+	while(++j < wait_time);
 }
 
 
 /* FreeRTOS tasks */
 
 static void DD_Scheduler() {
-	xQueueHandle function_called;
-	
+	xQueueHandle queue_handler;
+	dd_message message;
+
+	task_list *head_of_list = NULL;
+
+	task_param task;
+	scheduler_function func;
+
 	while(1) {
-		if ( xQueueReceive(DD_Scheduler_Queue, &function_called, 500) ) {
-			
+		if (xQueueReceive(DD_Scheduler_Queue, &queue_handler, 500)) {
+			if (xQueueReceive(queue_handler, &message, 500)) {
+
+				switch(message.function_to_call) {
+					case create:
+						task = message.task;
+						vTaskPrioritySet(task.t_handle, (UBaseType_t) 100/task.deadline);
+					
+						add_to_list(head_of_list, task);
+						break;
+
+					case delete:
+						printf("delete");
+						break;
+
+					case return_overdue_list:
+						printf("overdue");
+						break;
+
+					case return_active_list:
+						printf("active");
+						break;
+
+				}
+			}
 		}
 	}
-	
+
 }
 
 static void Task_Generator() {
-	
 	while(1) {
-		
+		task_param aperiodic_task;
+
+		aperiodic_task = generate_aperiodic_task();
+		dd_tcreate(aperiodic_task);
+
+
+		vTaskDelay(5000);
 	}
 }
 
 static void User_Tasks() {
-	
+
 	while(1) {
-		
+
 	}
 }
 
-static void Monitor_Tasks() {
-	
+static void Monitor_Task() {
+
 	while(1) {
-		
+
 	}
-	
+
 }
 
 /*-----------------------------------------------------------*/
