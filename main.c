@@ -165,6 +165,8 @@ will remove items as they are added, meaning the send task should always find
 the queue empty. */
 #define mainQUEUE_LENGTH					( 1 )
 
+static xSemaphoreHandle xEventSemaphore = NULL;
+
 /*-----------------------------------------------------------*/
 
 /*
@@ -173,26 +175,56 @@ the queue empty. */
  */
 static void prvSetupHardware( void );
 
-struct task_list {
-	TaskHandle_t t_handle;
-	uint_32 deadline;
-	uint_32 task_type;
-	uint_32 creation_time;
-	struct task_list *next_cell;
-	struct task_list *previous_cell;
+typedef enum task_type {
+	PERIODIC = 0,
+	APERIODIC = 1
 };
 
-struct overdue_tasks {
+typedef enum scheduler_function {
+	create = 0,
+	delete = 1,
+	return_overdue_list = 2,
+	return_active_list = 3
+} scheduler_function;
+
+typedef struct task_param {
+	TaskHandle_t t_handle;
+	uint32_t release_time;
+	uint32_t exec_time;
+	uint32_t deadline;
+	int priority;
+	int task_type;
+} task_param;
+
+typedef struct dd_message {
+	scheduler_function function_to_call;
+	task_param task;
+} dd_message;
+
+
+typedef struct task_list {
+	TaskHandle_t t_handle;
+	uint32_t deadline;
+	uint32_t task_type;
+	uint32_t creation_time;
+	struct task_list *next_cell;
+} task_list;
+
+typedef struct overdue_tasks {
 	TaskHandle_t tid;
-	uint_32 deadline;
-	uint_32 task_type;
-	uint_32 creation_time;
-	struct overdue_tasks *next_cell; struct
-	overdue_tasks *previous_cell;
-};
+	uint32_t deadline;
+	uint32_t task_type;
+	uint32_t creation_time;
+	struct overdue_tasks *next_cell;
+} overdue_tasks;
 
 /* Queues */
 xQueueHandle DD_Scheduler_Queue = 0;
+xQueueHandle Highest_Priority_Task_Queue = 0;
+xQueueHandle Overdue_Task_To_Add_Queue = 0;
+
+/* Timer */
+TimerHandle_t DD_Scheduler_Timer;
 
 /* Tasks */
 static void DD_Scheduler();
@@ -200,90 +232,365 @@ static void Task_Generator();
 static void User_Tasks();
 static void Monitor_Task();
 
-/* DD scheduler interface functions */
-TaskHandle_t dd_tcreate(Task_param);
-uint_32 dd_delete(TaskHandle_t);
-uint_32 dd_return_active_list(**list);
-uint_32 dd_return_overdue_list(**list);
+static void dummy_task(uint32_t wait_time, TaskHandle_t *task_handle);
 
+/* DD scheduler interface functions */
+TaskHandle_t dd_tcreate(task_param task);
+uint32_t dd_delete(TaskHandle_t t_handle);
+uint32_t dd_return_active_list(struct task_list **list);
+uint32_t dd_return_overdue_list(struct overdue_tasks **list);
+
+/* aperiodic and periodic task generator helper functions */
+task_param generate_periodic_task();
+task_param generate_aperiodic_task();
+
+/* linked list helper functions */
+static void add_to_sched_list(task_list *head_of_list, task_param task);
+static void add_to_overdue(task_list *head_of_active_list, overdue_tasks *head_of_overdue_task_list, TaskHandle_t task_handle);
+static void remove_from_list(task_list *head_of_list, task_param *task);
+static void reassign_task_priorities();
+static void swap(task_list **head_ref, uint32_t x, uint32_t y);
+static int is_in_list(task_list *higest_priority_task);
+
+static void vCheckTaskDeadlineCallback(void* arg);
 
 /*-----------------------------------------------------------*/
 
 int main(void)
 {
 	prvSetupHardware();
-	
+
 	DD_Scheduler_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(uint32_t));
+	Highest_Priority_Task_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(task_list));
+	Overdue_Task_To_Add_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(TaskHandle_t));
+
+	DD_Scheduler_Timer = xTimerCreate("DD_Scheduler_Timer", pdMS_TO_TICKS(5000), pdFALSE, (void *) 0, vCheckTaskDeadlineCallback);
 
 	xTaskCreate(DD_Scheduler, "DD_Scheduler", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 	xTaskCreate(Task_Generator, "Task_Generator", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 	xTaskCreate(User_Tasks, "User_Tasks", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 	xTaskCreate(Monitor_Task, "Monitor_Task", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
-	
+
 	/* Start the tasks and timer running. */
 	vTaskStartScheduler();
-
 }
 
 /* DD Scheduler interface functions */
-TaskHandle_t dd_tcreate(Task_param) {
+TaskHandle_t dd_tcreate(task_param task) {
 	xQueueHandle Task_Creator_Queue;
-	Task_Creator_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(uint32_t));
-	
-	
-	
-	
+	Task_Creator_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(dd_message));
+	TaskHandle_t task_handle;
+
+	xTaskCreate(dummy_task, "dummy_task", configMINIMAL_STACK_SIZE, NULL, 1, &task_handle);
+
+	task.t_handle = task_handle;
+
+	dd_message dd_scheduler_message;
+	dd_scheduler_message.function_to_call = create;
+	dd_scheduler_message.task = task;
+
+	xQueueSend(Task_Creator_Queue, &dd_scheduler_message, 1000);
+	xQueueSend(DD_Scheduler_Queue, &Task_Creator_Queue, 1000);
 }
 
-uint_32 dd_delete(TaskHandle_t) {
-	
+uint32_t dd_delete(TaskHandle_t t_handle) {
+	xQueueHandle Task_Delete_Queue;
+	Task_Delete_Queue = xQueueCreate(mainQUEUE_LENGTH, sizeof(dd_message));
+
+	task_param task;
+	task.t_handle = t_handle;
+
+	dd_message dd_scheduler_message;
+	dd_scheduler_message.function_to_call = delete;
+	dd_scheduler_message.task = task;
+
+	xQueueSend(Task_Delete_Queue, &dd_scheduler_message, 1000);
+	xQueueSend(DD_Scheduler_Queue, &Task_Delete_Queue, 1000);
 }
 
-uint_32 dd_return_active_list(**list) {
-	
+uint32_t dd_return_active_list(struct task_list **list) {
+
 }
 
-uint_32 dd_return_overdue_list(**list) {
-	
+uint32_t dd_return_overdue_list(struct overdue_tasks **list) {
+
 }
 
+
+/* periodic and aperiodic task generators */
+
+task_param generate_periodic_task() {
+	struct task_param periodic_task;
+
+	return periodic_task;
+}
+
+task_param generate_aperiodic_task() {
+	task_param aperiodic_task;
+
+	aperiodic_task.exec_time = 100;
+	aperiodic_task.release_time = 0;
+	aperiodic_task.deadline = 200;
+	aperiodic_task.task_type = APERIODIC;
+
+	return aperiodic_task;
+}
+
+static void remove_from_list(task_list *head_of_list, task_param *task) {
+	task_list *pointer1, *prev_pointer;
+
+	pointer1 = head_of_list;
+	prev_pointer = NULL;
+
+	while (pointer1 != NULL) {
+		if (pointer1->t_handle == task->t_handle) {
+			if (prev_pointer != NULL) {
+				prev_pointer->next_cell = pointer1->next_cell;
+			}
+			else {
+				head_of_list = pointer1->next_cell;
+			}
+			// write the deadline as -1 to indicate that it has been deleted
+			pointer1->deadline = -1;
+			return;
+		}
+		prev_pointer = pointer1;
+		pointer1 = pointer1->next_cell;
+	}
+
+}
+
+static void add_to_sched_list(task_list *head_of_list, task_param task) {
+	task_list *task_to_add = (task_list*) malloc(sizeof(task_list));
+
+	task_to_add->deadline = task.deadline;
+	task_to_add->task_type = task.task_type;
+	task_to_add->creation_time = task.release_time;
+	task_to_add->next_cell = NULL;
+	task_to_add->t_handle = task.t_handle;
+
+	if (head_of_list == NULL) {
+		head_of_list = task_to_add;
+	}
+
+	else {
+		task_to_add->next_cell = head_of_list;
+		head_of_list = task_to_add;
+	}
+
+}
+
+static void reassign_task_priorities(task_list *head_of_list) {
+	int swapped, count;
+	task_list *pointer1;
+	task_list *pointer2;
+
+	if (head_of_list == NULL)
+		return;
+
+	count = 0;
+	do {
+		swapped = 0;
+		pointer1 = head_of_list;
+
+		while (pointer1->next_cell != pointer2) {
+			if (pointer1->deadline > pointer1->next_cell->deadline) {
+				swap(&head_of_list, pointer1->deadline, pointer1->next_cell->deadline);
+				swapped = 1;
+			}
+
+			pointer1 = pointer1->next_cell;
+		}
+		count++;
+		pointer2 = pointer1;
+	}
+	while(swapped);
+
+	pointer1 = head_of_list;
+
+	// reset the priorities
+	while(pointer1 != NULL) {
+		vTaskPrioritySet(pointer1->t_handle, count);
+		count--;
+	}
+}
+
+static void swap(task_list **head_ref, uint32_t x, uint32_t y) {
+	   // Nothing to do if x and y are same
+	   if (x == y) return;
+
+	   // Search for x (keep track of prevX and CurrX
+	   struct task_list *prevX = NULL, *currX = *head_ref;
+	   while (currX && currX->deadline != x)
+	   {
+	       prevX = currX;
+	       currX = currX->next_cell;
+	   }
+
+	   // Search for y (keep track of prevY and CurrY
+	   task_list *prevY = NULL, *currY = *head_ref;
+	   while (currY && currY->deadline != y)
+	   {
+	       prevY = currY;
+	       currY = currY->next_cell;
+	   }
+
+	   // If either x or y is not present, nothing to do
+	   if (currX == NULL || currY == NULL)
+	       return;
+
+	   // If x is not head of linked list
+	   if (prevX != NULL)
+	       prevX->next_cell = currY;
+	   else // Else make y as new head
+	       *head_ref = currY;
+
+	   // If y is not head of linked list
+	   if (prevY != NULL)
+	       prevY->next_cell = currX;
+	   else  // Else make x as new head
+	       *head_ref = currX;
+
+	   // Swap next pointers
+	   task_list *temp = currY->next_cell;
+	   currY->next_cell = currX->next_cell;
+	   currX->next_cell  = temp;
+}
+
+static int is_in_list(task_list *highest_priority_task) {
+	// if the task has been deleted from the list, the deadline will be set to -1
+	if(highest_priority_task->deadline == -1) {
+		return 0;
+	}
+	return 1;
+}
+
+static void add_to_overdue(task_list *head_of_active_list, overdue_tasks *head_of_overdue_task_list, TaskHandle_t task_handle) {
+	task_list *pointer1;
+
+	overdue_tasks *task_to_add = (overdue_tasks*) malloc(sizeof(overdue_tasks));
+
+	pointer1 = head_of_active_list;
+
+	while (pointer1 != NULL) {
+		if (pointer1->t_handle == task_handle) {
+			task_to_add->deadline = pointer1->deadline;
+			task_to_add->task_type = pointer1->task_type;
+			task_to_add->creation_time = pointer1->creation_time;
+			task_to_add->next_cell = NULL;
+			task_to_add->tid = pointer1->t_handle;
+
+			if (head_of_overdue_task_list == NULL) {
+				head_of_overdue_task_list = task_to_add;
+			}
+
+			else {
+				task_to_add->next_cell = head_of_overdue_task_list;
+				head_of_overdue_task_list = task_to_add;
+			}
+		}
+	}
+}
 
 /* FreeRTOS tasks */
 
 static void DD_Scheduler() {
-	xQueueHandle function_called;
-	
+	xQueueHandle queue_handler;
+	dd_message message;
+
+	task_list *head_of_active_list = NULL;
+	overdue_tasks *head_of_overdue_list = NULL;
+
+	task_param task;
+
+	TaskHandle_t *overdue_task_to_add;
+
 	while(1) {
-		if ( xQueueReceive(DD_Scheduler_Queue, &function_called, 500) ) {
-			
+		if (xQueueReceive(DD_Scheduler_Queue, &queue_handler, 500)) {
+			if (xQueueReceive(queue_handler, &message, 500)) {
+
+				switch(message.function_to_call) {
+					case create:
+						task = message.task;
+						add_to_sched_list(head_of_active_list, task);
+						reassign_task_priorities(head_of_active_list);
+						break;
+
+					case delete:
+						task = message.task;
+						remove_from_list(head_of_active_list, &task);
+						break;
+
+					case return_overdue_list:
+						printf("overdue");
+						break;
+
+					case return_active_list:
+						printf("active");
+						break;
+
+				}
+				// write the highest priority task to the queue (which is also the head of the list)
+				xQueueSend(Highest_Priority_Task_Queue, head_of_active_list, 1000);
+
+			}
+		}
+		if (xQueueReceive(Overdue_Task_To_Add_Queue, &overdue_task_to_add, 100)) {
+			add_to_overdue(head_of_active_list, head_of_overdue_list, overdue_task_to_add);
 		}
 	}
-	
+
 }
 
 static void Task_Generator() {
-	
 	while(1) {
-		
+		task_param aperiodic_task;
+
+		aperiodic_task = generate_aperiodic_task();
+		dd_tcreate(aperiodic_task);
+
+
+		vTaskDelay(5000);
 	}
 }
 
 static void User_Tasks() {
-	
 	while(1) {
-		
+
 	}
 }
 
-static void Monitor_Tasks() {
-	
+static void Monitor_Task() {
 	while(1) {
-		
+
 	}
-	
+
 }
+
+
+static void dummy_task(uint32_t wait_time, TaskHandle_t *task_handle) {
+	int j = 0;
+
+	while(++j < wait_time);
+
+	dd_delete(task_handle);
+}
+
 
 /*-----------------------------------------------------------*/
+static void vCheckTaskDeadlineCallback(void* args) {
+	// needs to check and make sure that the task isn't still in dd_scheduler list
+	// if present, remove and place in overdue list
+
+	task_list *task_to_check;
+
+	if (xQueueReceive(Highest_Priority_Task_Queue, &task_to_check, 500)) {
+		if (is_in_list(task_to_check) == 1) {
+			// add to overdue list and delete from active task list
+		}
+	}
+}
+
 
 void vApplicationTickHook( void )
 {
@@ -381,4 +688,3 @@ static void prvSetupHardware( void )
 	/* TODO: Setup the clocks, etc. here, if they were not configured before
 	main() was called. */
 }
-
